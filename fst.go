@@ -16,6 +16,7 @@ package vellum
 
 import (
 	"io"
+	"log"
 
 	"github.com/bits-and-blooms/bitset"
 )
@@ -72,8 +73,12 @@ func (f *FST) get(input []byte, prealloc fstState) (uint64, bool, error) {
 	curr := f.decoder.getRoot()
 	state, err := f.decoder.stateAt(curr, prealloc)
 	if err != nil {
+		log.Printf("get(): error getting root state input traversed: %v", string(input))
+
 		return 0, false, err
 	}
+
+	runInp := ""
 	for _, c := range input {
 		_, curr, output := state.TransitionFor(c)
 		if curr == noneAddr {
@@ -82,9 +87,12 @@ func (f *FST) get(input []byte, prealloc fstState) (uint64, bool, error) {
 
 		state, err = f.decoder.stateAt(curr, state)
 		if err != nil {
+			log.Printf("get(): error getting state in between input traversed: %v", string(runInp))
+
 			return 0, false, err
 		}
 
+		runInp += string(c)
 		total += output
 	}
 
