@@ -17,10 +17,12 @@ package vellum
 import (
 	"bytes"
 	"io"
+	"reflect"
 )
 
 var defaultBuilderOpts = &BuilderOpts{
 	Encoder:           1,
+	outType:           storeIntSlice,
 	RegistryTableSize: 10000,
 	RegistryMRUSize:   2,
 }
@@ -41,6 +43,7 @@ type Builder struct {
 	builderNodePool *builderNodePool
 }
 
+const storeIntSlice = 42
 const noneAddr = 1
 const emptyAddr = 0
 
@@ -61,9 +64,13 @@ func newBuilder(w io.Writer, opts *BuilderOpts) (*Builder, error) {
 
 	var err error
 	rv.encoder, err = loadEncoder(opts.Encoder, w)
+	if opts.outType&storeIntSlice > 0 {
+		rv.encoder.setOutputType(opts.outType)
+	}
 	if err != nil {
 		return nil, err
 	}
+	rv.unfinished.outType = opts.outType
 	err = rv.encoder.start()
 	if err != nil {
 		return nil, err
@@ -88,7 +95,7 @@ func (b *Builder) Reset(w io.Writer) error {
 
 // Insert the provided value to the set being built.
 // NOTE: values must be inserted in lexicographical order.
-func (b *Builder) Insert(key []byte, val uint64) error {
+func (b *Builder) Insert(key []byte, val interface{}) error {
 	// ensure items are added in lexicographic order
 	if bytes.Compare(key, b.last) < 0 {
 		return ErrOutOfOrder
@@ -144,6 +151,7 @@ func (b *Builder) compileFrom(iState int) error {
 			node = b.unfinished.popFreeze(addr)
 		}
 		var err error
+		node.outType = b.opts.outType
 		addr, err = b.compile(node)
 		if err != nil {
 			return nil
@@ -153,9 +161,22 @@ func (b *Builder) compileFrom(iState int) error {
 	return nil
 }
 
+func (b *Builder) isEmptyFinalOutput(s *builderNode) bool {
+	switch b.opts.outType {
+	case storeIntSlice:
+		// or what about nil []uint64?
+		val, _ := s.finalOutput.([]uint64)
+		return len(val) == 0
+	default:
+		val, _ := s.finalOutput.(uint64)
+		return val == 0
+	}
+
+}
+
 func (b *Builder) compile(node *builderNode) (int, error) {
 	if node.final && len(node.trans) == 0 &&
-		node.finalOutput == 0 {
+		b.isEmptyFinalOutput(node) {
 		return 0, nil
 	}
 	found, addr, entry := b.registry.entry(node)
@@ -181,8 +202,8 @@ type unfinishedNodes struct {
 	// same access pattern, and don't track items separately
 	// this means calls get() and pushXYZ() must be paired,
 	// as well as calls put() and popXYZ()
-	cache []builderNodeUnfinished
-
+	cache           []builderNodeUnfinished
+	outType         int
 	builderNodePool *builderNodePool
 }
 
@@ -222,14 +243,26 @@ func (u *unfinishedNodes) put() {
 	u.cache[len(u.stack)] = builderNodeUnfinished{}
 }
 
+func (u *unfinishedNodes) isEmptyFinalOutput(out interface{}) bool {
+	switch u.outType {
+	case storeIntSlice:
+		val, _ := out.([]uint64)
+		return len(val) == 0
+	default:
+		val, _ := out.(uint64)
+		return val == 0
+	}
+
+}
+
 func (u *unfinishedNodes) findCommonPrefixAndSetOutput(key []byte,
-	out uint64) (int, uint64) {
+	out interface{}) (int, interface{}) {
 	var i int
 	for i < len(key) {
 		if i >= len(u.stack) {
 			break
 		}
-		var addPrefix uint64
+		var addPrefix interface{}
 		if !u.stack[i].hasLastT {
 			break
 		}
@@ -243,7 +276,7 @@ func (u *unfinishedNodes) findCommonPrefixAndSetOutput(key []byte,
 			break
 		}
 
-		if addPrefix != 0 {
+		if !u.isEmptyFinalOutput(addPrefix) {
 			u.stack[i].addOutputPrefix(addPrefix)
 		}
 	}
@@ -286,7 +319,7 @@ func (u *unfinishedNodes) popEmpty() *builderNode {
 	return rv
 }
 
-func (u *unfinishedNodes) setRootOutput(out uint64) {
+func (u *unfinishedNodes) setRootOutput(out interface{}) {
 	u.stack[0].node.final = true
 	u.stack[0].node.finalOutput = out
 }
@@ -296,7 +329,16 @@ func (u *unfinishedNodes) topLastFreeze(addr int) {
 	u.stack[last].lastCompiled(addr)
 }
 
-func (u *unfinishedNodes) addSuffix(bs []byte, out uint64) {
+func (u *unfinishedNodes) zeroOutput() interface{} {
+	switch u.outType {
+	case storeIntSlice:
+		return []uint64{}
+	default:
+		return 0
+	}
+}
+
+func (u *unfinishedNodes) addSuffix(bs []byte, out interface{}) {
 	if len(bs) == 0 {
 		return
 	}
@@ -309,7 +351,7 @@ func (u *unfinishedNodes) addSuffix(bs []byte, out uint64) {
 		next.node = u.builderNodePool.Get()
 		next.hasLastT = true
 		next.lastIn = b
-		next.lastOut = 0
+		next.lastOut = u.zeroOutput()
 		u.stack = append(u.stack, next)
 	}
 	u.pushEmpty(true)
@@ -317,17 +359,26 @@ func (u *unfinishedNodes) addSuffix(bs []byte, out uint64) {
 
 type builderNodeUnfinished struct {
 	node     *builderNode
-	lastOut  uint64
+	lastOut  interface{}
 	lastIn   byte
 	hasLastT bool
+	outType  int
 }
 
+func (f *builderNodeUnfinished) zeroOutput() interface{} {
+	switch f.outType {
+	case storeIntSlice:
+		return []uint64{}
+	default:
+		return 0
+	}
+}
 func (b *builderNodeUnfinished) lastCompiled(addr int) {
 	if b.hasLastT {
 		transIn := b.lastIn
 		transOut := b.lastOut
 		b.hasLastT = false
-		b.lastOut = 0
+		b.lastOut = b.zeroOutput()
 		b.node.trans = append(b.node.trans, transition{
 			in:   transIn,
 			out:  transOut,
@@ -336,7 +387,7 @@ func (b *builderNodeUnfinished) lastCompiled(addr int) {
 	}
 }
 
-func (b *builderNodeUnfinished) addOutputPrefix(prefix uint64) {
+func (b *builderNodeUnfinished) addOutputPrefix(prefix interface{}) {
 	if b.node.final {
 		b.node.finalOutput = outputCat(prefix, b.node.finalOutput)
 	}
@@ -349,10 +400,10 @@ func (b *builderNodeUnfinished) addOutputPrefix(prefix uint64) {
 }
 
 type builderNode struct {
-	finalOutput uint64
+	finalOutput interface{}
 	trans       []transition
 	final       bool
-
+	outType     int
 	// intrusive linked list
 	next *builderNode
 }
@@ -368,11 +419,24 @@ func (n *builderNode) reset() {
 	n.next = nil
 }
 
+func areOutputsEquiv(l interface{}, r interface{}) bool {
+	lv, ok := l.([]uint64)
+	if ok {
+		rv, _ := r.([]uint64)
+		// is this fine or do we do something else?
+		return reflect.DeepEqual(lv, rv)
+	}
+
+	lIn, _ := l.(uint64)
+	rIn, _ := r.(uint64)
+	return lIn == rIn
+}
+
 func (n *builderNode) equiv(o *builderNode) bool {
 	if n.final != o.final {
 		return false
 	}
-	if n.finalOutput != o.finalOutput {
+	if !areOutputsEquiv(n.finalOutput, o.finalOutput) {
 		return false
 	}
 	if len(n.trans) != len(o.trans) {
@@ -386,7 +450,7 @@ func (n *builderNode) equiv(o *builderNode) bool {
 		if ntrans.addr != otrans.addr {
 			return false
 		}
-		if ntrans.out != otrans.out {
+		if !areOutputsEquiv(ntrans.out, otrans.out) {
 			return false
 		}
 	}
@@ -396,24 +460,71 @@ func (n *builderNode) equiv(o *builderNode) bool {
 var emptyTransition = transition{}
 
 type transition struct {
-	out  uint64
+	out  interface{}
 	addr int
 	in   byte
 }
 
-func outputPrefix(l, r uint64) uint64 {
-	if l < r {
-		return l
+func intSlicePrefixOffset(l, r interface{}) int {
+	_l, _ := l.([]uint64)
+	_r, _ := r.([]uint64)
+	prefIdx := 0
+	for i := range _l {
+		if i >= len(_r) || _l[i] != _r[i] {
+			break
+		}
+		prefIdx++
 	}
-	return r
+	return prefIdx
 }
 
-func outputSub(l, r uint64) uint64 {
-	return l - r
+func outputPrefix(l, r interface{}) interface{} {
+	_lb, ok := l.([]uint64)
+	if ok {
+		return _lb[:intSlicePrefixOffset(l, r)]
+	}
+	_l, _ := l.(uint64)
+	_r, _ := r.(uint64)
+
+	if _l < _r {
+		return _l
+	}
+	return _r
 }
 
-func outputCat(l, r uint64) uint64 {
-	return l + r
+func intSliceSub(l, r interface{}) []uint64 {
+	_l, _ := l.([]uint64)
+	_r, _ := r.([]uint64)
+	return _l[intSlicePrefixOffset(_l, _r):]
+}
+
+func outputSub(l, r interface{}) interface{} {
+	_, ok := l.([]uint64)
+	if ok {
+		return intSliceSub(l, r)
+	}
+	_l, _ := l.(uint64)
+	_r, _ := r.(uint64)
+	return _l - _r
+}
+
+func intSliceCat(l, r interface{}) []uint64 {
+	_l, _ := l.([]uint64)
+	_r, _ := r.([]uint64)
+	var rv []uint64
+	rv = append(rv, _l...)
+	rv = append(rv, _r...)
+	return rv
+}
+
+func outputCat(l, r interface{}) interface{} {
+	_, ok := l.([]uint64)
+	if ok {
+		return intSliceCat(l, r)
+	}
+	_l, _ := l.(uint64)
+	_r, _ := r.(uint64)
+	return _l + _r
 }
 
 // builderNodePool pools builderNodes using a singly linked list.
@@ -423,12 +534,13 @@ func outputCat(l, r uint64) uint64 {
 // |    Unfinished Nodes    |      Transfer once         |        Registry      |
 // |(not frozen builderNode)|-----builderNode is ------->| (frozen builderNode) |
 // +------------------------+      marked frozen         +----------------------+
-//              ^                                                     |
-//              |                                                     |
-//              |                                                   Put()
-//              | Get() on        +-------------------+             when
-//              +-new char--------| builderNode Pool  |<-----------evicted
-//                                +-------------------+
+//
+//	^                                                     |
+//	|                                                     |
+//	|                                                   Put()
+//	| Get() on        +-------------------+             when
+//	+-new char--------| builderNode Pool  |<-----------evicted
+//	                  +-------------------+
 type builderNodePool struct {
 	head *builderNode
 }
