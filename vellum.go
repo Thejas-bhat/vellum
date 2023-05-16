@@ -32,7 +32,6 @@ Once the FST is ready, you can use the Contains() method to see if a keys is
 in the FST.  You can use the Get() method to see if a key is in the FST and
 retrieve it's associated value.  And, you can use the Iterator method to
 enumerate key/value pairs within a specified range.
-
 */
 package vellum
 
@@ -44,6 +43,10 @@ import (
 // ErrOutOfOrder is returned when values are not inserted in
 // lexicographic order.
 var ErrOutOfOrder = errors.New("values not inserted in lexicographic order")
+
+// ErrUnexpectedType is returned when values are not of the same data
+// type
+var ErrUnexpectedType = errors.New("values not of the same type")
 
 // ErrIteratorDone is returned by Iterator/Next/Seek methods when the
 // Current() value pointed to by the iterator is greater than the last
@@ -57,6 +60,7 @@ type BuilderOpts struct {
 	Encoder           int
 	RegistryTableSize int
 	RegistryMRUSize   int
+	outType           int
 }
 
 // New returns a new Builder which will stream out the
